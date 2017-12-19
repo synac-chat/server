@@ -301,7 +301,7 @@ fn main() {
 }
 
 pub const TOKEN_CHARS: &[u8; 62] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-pub const RESERVED_ROLES: usize = 2;
+pub const RESERVED_GROUPS: usize = 2;
 
 fn calculate_permissions(
         db: &SqlConnection,
@@ -310,7 +310,7 @@ fn calculate_permissions(
         chan_overrides: Option<&HashMap<usize, (u8, u8)>>
     ) -> u8 {
     let mut query = String::with_capacity(48+3+1+14);
-    query.push_str("SELECT allow, deny FROM groups WHERE id IN (");
+    query.push_str("SELECT allow, deny, id, pos FROM groups WHERE id IN (");
     query.push_str(if bot { "2" } else { "1" });
     if !groups.is_empty() {
         query.push_str(", ");
@@ -319,17 +319,28 @@ fn calculate_permissions(
     query.push_str(") ORDER BY pos");
 
     let mut stmt = db.prepare(&query).unwrap();
-    let rows = stmt.query_map(&[], |row| (row.get(0), row.get(1))).unwrap();
-    let mut rows = rows.map(|row| row.unwrap());
+    let rows = stmt.query_map(&[], |row| (row.get(0), row.get(1), row.get(2), row.get(3))).unwrap();
+    let rows: Vec<(u8, u8, i64, i64)> = rows.map(|row| row.unwrap()).collect();
 
     let mut perms = 0;
-    common::perm_apply_iter(&mut perms, &mut rows);
+    common::perm_apply_iter(&mut perms, &mut rows.iter().map(|&(allow, deny, ..)| (allow, deny)));
 
     if let Some(chan_overrides) = chan_overrides {
-        for (role, chan_perms) in chan_overrides {
-            if *role <= RESERVED_ROLES || groups.contains(role) {
-                common::perm_apply(&mut perms, *chan_perms);
-            }
+        let mut chan_overrides: Vec<_> = chan_overrides.iter()
+            .filter_map(|(group, chan_perms)| {
+                let pos = rows.iter()
+                    .find(|&&(_, _, id, _)| id as usize == *group)
+                    .map(|&(_, _, _, pos)| pos as usize);
+                if pos.is_none() || pos.unwrap() == 0 {
+                    return None;
+                }
+                Some((pos.unwrap(), chan_perms))
+            })
+            .collect();
+        chan_overrides.sort_by_key(|&(pos, _)| pos);
+
+        for (_, chan_perms) in chan_overrides {
+            common::perm_apply(&mut perms, *chan_perms);
         }
     }
 
@@ -345,7 +356,7 @@ fn calculate_permissions_by_user(
 
     if let Some(row) = rows.next() {
         let row = row.unwrap();
-        // Yes I realize I could pass row.get(0) directly.
+        // Yes I realize I could pass row.get(1) directly.
         // However, what about SQL injections?
         Some(calculate_permissions(db, row.get(0), &get_list(&row.get::<_, String>(1)), chan_overrides))
     } else {
@@ -510,7 +521,7 @@ fn insert_channel_overrides(db: &SqlConnection, channel: usize, overrides: &Hash
             |row| row.get(0)
         ).unwrap();
         if count != 0 {
-            stmt_insert.execute(&[&allow, &(*id as i64), &(channel as i64), &deny]).unwrap();
+            stmt_insert.execute(&[&allow, &(channel as i64), &deny, &(*id as i64)]).unwrap();
         }
     }
 }
@@ -1597,7 +1608,7 @@ fn handle_packet(
                 ) {
                     let mut ok = true;
                     for group in changed {
-                        if group <= RESERVED_ROLES {
+                        if group <= RESERVED_GROUPS {
                             ok = false;
                             break;
                         }
