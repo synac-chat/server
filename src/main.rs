@@ -86,7 +86,9 @@ fn main() {
                     channel INTEGER NOT NULL,
                     user    INTEGER NOT NULL,
 
-                    mode    INTEGER NOT NULL
+                    mode    INTEGER NOT NULL,
+
+                    CONSTRAINT [unique] UNIQUE (channel, user)
                 )", &[])
         .expect("SQLite table creation failed");
     db.execute("CREATE TABLE IF NOT EXISTS users (
@@ -95,7 +97,6 @@ fn main() {
                     bot         INTEGER NOT NULL,
                     id          INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
                     last_ip     TEXT NOT NULL,
-                    mode        INTEGER,
                     name        TEXT NOT NULL COLLATE NOCASE,
                     password    TEXT NOT NULL,
                     token       TEXT NOT NULL
@@ -404,8 +405,9 @@ fn get_user_by_fields(db: &SqlConnection, row: &SqlRow) -> common::User {
         ban: row.get(1),
         bot: row.get(2),
         id: id,
+        // last_ip is 4
         modes: get_modes_by_user(db, id),
-        name: row.get(4)
+        name: row.get(5)
     }
 }
 fn calculate_permissions(bot: bool, mode: Option<u8>, default_bot: u8, default_user: u8) -> u8 {
@@ -415,17 +417,22 @@ fn calculate_permissions(bot: bool, mode: Option<u8>, default_bot: u8, default_u
         mode.unwrap_or(default_user)
     }
 }
-fn calculate_permissions_by_user(db: &SqlConnection, id: usize, default_bot: u8, default_user: u8) -> Option<u8> {
-    let mut stmt = db.prepare_cached("SELECT bot, mode FROM users WHERE id = ?").unwrap();
+fn calculate_permissions_by_user(db: &SqlConnection, id: usize, channel: usize,
+                                 default_bot: u8, default_user: u8) -> Option<u8> {
+    let mut stmt = db.prepare_cached("SELECT bot FROM users WHERE id = ?").unwrap();
     let mut rows = stmt.query(&[&(id as i64)]).unwrap();
 
-    if let Some(row) = rows.next() {
-        let row = row.unwrap();
+    let bot = rows.next()?.unwrap().get(0);
 
-        Some(calculate_permissions(row.get(0), row.get(1), default_bot, default_user))
-    } else {
-        None
-    }
+    let mut stmt = db.prepare_cached("SELECT mode FROM modes WHERE user = ? AND channel = ?").unwrap();
+    let mut rows = stmt.query(&[&(id as i64), &(channel as i64)]).unwrap();
+
+    let mode = rows.next().map(|row| row.unwrap().get(0));
+
+    Some(calculate_permissions(bot, mode, default_bot, default_user))
+}
+fn calculate_permissions_by_channel(db: &SqlConnection, id: usize, channel: &common::Channel) -> Option<u8> {
+    calculate_permissions_by_user(db, id, channel.id, channel.default_mode_bot, channel.default_mode_user)
 }
 fn has_perm(config: &Config, user: usize, bitmask: u8, perm: u8) -> bool {
     config.owner_id == user || bitmask & perm == perm
@@ -438,7 +445,7 @@ fn write<T: std::io::Write>(writer: &mut T, packet: Packet) -> bool {
     true
 }
 fn write_broadcast(
-    channel_modes: Option<(u8, u8)>, // default_mode_bot and default_mode_user
+    channel: Option<&common::Channel>, // default_mode_bot and default_mode_user
     config: &Config,
     db: &SqlConnection,
     packet: &Packet,
@@ -455,11 +462,11 @@ fn write_broadcast(
     sessions.retain(|i, s| {
         if let Some(id) = s.id {
             // Check if the user really has permission to read this message.
-            if let Some(modes) = channel_modes {
+            if let Some(channel) = channel {
                 if !has_perm(
                     config,
                     id,
-                    calculate_permissions_by_user(db, id, modes.0, modes.1).unwrap(),
+                    calculate_permissions_by_channel(db, id, &channel).unwrap(),
                     common::PERM_READ
                 ) {
                     return true;
@@ -517,7 +524,7 @@ impl UserSession {
 
 enum Reply {
     // Send the message to all clients (optionally restricted to channel)
-    Broadcast(Option<(u8, u8)>, Packet),
+    Broadcast(Option<common::Channel>, Packet),
     // Send the message to all clients with ID
     Private(usize, Packet),
     // Send initial packets like channels, et.c
@@ -592,9 +599,9 @@ fn handle_client(
                     }
 
                     match reply {
-                        Reply::Broadcast(channel_modes, packet) => {
+                        Reply::Broadcast(channel, packet) => {
                             write_broadcast(
-                                channel_modes,
+                                channel.as_ref(),
                                 &config,
                                 &db,
                                 &packet,
@@ -723,35 +730,43 @@ fn handle_packet(
 
     match packet {
         Packet::Close => { Reply::Close }
-        Packet::ChannelCreate(channel) => {
+        Packet::ChannelCreate(new) => {
             let id = get_id!();
             rate_limit!(id, cheap);
 
-            if channel.name.len() < config.limit_channel_name_min
-                || channel.name.len() > config.limit_channel_name_max {
+            let mut user = get_user(db, id).unwrap();
+
+            if new.name.len() < config.limit_channel_name_min
+                || new.name.len() > config.limit_channel_name_max {
                 return Reply::Reply(Packet::Err(common::ERR_LIMIT_REACHED));
             }
-            if !has_perm(
-                config,
-                id,
-                calculate_permissions_by_user(&db, id, channel.default_mode_bot, channel.default_mode_user).unwrap(),
-                common::PERM_MANAGE_CHANNELS
-            ) {
+            if !user.admin {
                 return Reply::Reply(Packet::Err(common::ERR_MISSING_PERMISSION));
             }
 
             db.execute(
-                "INSERT INTO channels (name) VALUES (?)",
-                &[&channel.name]
+                "INSERT INTO channels (default_mode_bot, default_mode_user, name) VALUES (?, ?, ?)",
+                &[&new.default_mode_bot, &new.default_mode_user, &new.name]
             ).unwrap();
             let channel_id = db.last_insert_rowid() as usize;
 
+            db.execute(
+                "INSERT INTO modes (channel, user, mode) VALUES (?, ?, ?)",
+                &[&(channel_id as i64), &(id as i64), &common::PERM_ALL]
+            ).unwrap();
+
+            user.modes = get_modes_by_user(db, user.id);
+
+            let packet = Packet::UserReceive(common::UserReceive {
+                inner: user
+            });
+            write_broadcast(None, config, db, &packet, None, sessions);
             Reply::Broadcast(None, Packet::ChannelReceive(common::ChannelReceive {
                 inner: common::Channel {
-                    default_mode_bot: channel.default_mode_bot,
-                    default_mode_user: channel.default_mode_user,
+                    default_mode_bot: new.default_mode_bot,
+                    default_mode_user: new.default_mode_user,
                     id: channel_id,
-                    name: channel.name
+                    name: new.name
                 }
             }))
         },
@@ -764,15 +779,15 @@ fn handle_packet(
             if !has_perm(
                 config,
                 id,
-                calculate_permissions_by_user(db, id, channel.default_mode_bot, channel.default_mode_user).unwrap(),
+                calculate_permissions_by_channel(db, id, &channel).unwrap(),
                 common::PERM_MANAGE_CHANNELS
             ) {
                 return Reply::Reply(Packet::Err(common::ERR_MISSING_PERMISSION));
             }
 
-            db.execute("DELETE FROM messages WHERE channel = ?", &[&(event.id as i64)]).unwrap();
-            db.execute("DELETE FROM overrides WHERE channel = ?", &[&(event.id as i64)]).unwrap();
             db.execute("DELETE FROM channels WHERE id = ?", &[&(event.id as i64)]).unwrap();
+            db.execute("DELETE FROM messages WHERE channel = ?", &[&(event.id as i64)]).unwrap();
+            db.execute("DELETE FROM modes WHERE channel = ?", &[&(event.id as i64)]).unwrap();
 
             Reply::Broadcast(None, Packet::ChannelDeleteReceive(common::ChannelDeleteReceive {
                 inner: channel
@@ -793,15 +808,15 @@ fn handle_packet(
             if !has_perm(
                 config,
                 id,
-                calculate_permissions_by_user(db, id, channel.default_mode_bot, channel.default_mode_user).unwrap(),
+                calculate_permissions_by_channel(db, id, &channel).unwrap(),
                 common::PERM_MANAGE_CHANNELS
             ) {
                 return Reply::Reply(Packet::Err(common::ERR_MISSING_PERMISSION));
             }
 
             db.execute(
-                "UPDATE channels SET name = ? WHERE id = ?",
-                &[&new.name, &(new.id as i64)]
+                "UPDATE channels SET default_mode_bot = ?, default_mode_user = ?, name = ? WHERE id = ?",
+                &[&new.default_mode_bot, &new.default_mode_user, &new.name, &(new.id as i64)]
             ).unwrap();
 
             Reply::Broadcast(None, Packet::ChannelReceive(common::ChannelReceive {
@@ -1026,7 +1041,7 @@ fn handle_packet(
             if !has_perm(
                 config,
                 id,
-                calculate_permissions_by_user(db, id, channel.default_mode_bot, channel.default_mode_user).unwrap(),
+                calculate_permissions_by_channel(db, id, &channel).unwrap(),
                 common::PERM_WRITE
             ) {
                 return Reply::Reply(Packet::Err(common::ERR_MISSING_PERMISSION));
@@ -1037,7 +1052,7 @@ fn handle_packet(
                 &[&(id as i64), &(msg.channel as i64), &msg.text, &timestamp]
             ).unwrap();
 
-            Reply::Broadcast(Some((channel.default_mode_bot, channel.default_mode_user)),
+            Reply::Broadcast(Some(channel),
                              Packet::MessageReceive(common::MessageReceive {
                 inner: common::Message {
                     author: id,
@@ -1060,7 +1075,7 @@ fn handle_packet(
             if msg.author != id && !has_perm(
                 config,
                 id,
-                calculate_permissions_by_user(db, id, channel.default_mode_bot, channel.default_mode_user).unwrap(),
+                calculate_permissions_by_channel(db, id, &channel).unwrap(),
                 common::PERM_MANAGE_MESSAGES
             ) {
                 return Reply::Reply(Packet::Err(common::ERR_MISSING_PERMISSION));
@@ -1071,7 +1086,7 @@ fn handle_packet(
                 &[&(event.id as i64)]
             ).unwrap();
 
-            Reply::Broadcast(Some((channel.default_mode_bot, channel.default_mode_user)),
+            Reply::Broadcast(Some(channel),
                              Packet::MessageDeleteReceive(common::MessageDeleteReceive {
                 id: event.id
             }))
@@ -1089,7 +1104,7 @@ fn handle_packet(
             let has = has_perm(
                 config,
                 id,
-                calculate_permissions_by_user(db, id, channel.default_mode_bot, channel.default_mode_user).unwrap(),
+                calculate_permissions_by_channel(db, id, &channel).unwrap(),
                 common::PERM_MANAGE_MESSAGES
             );
 
@@ -1126,14 +1141,7 @@ fn handle_packet(
                 let packet = Packet::MessageDeleteReceive(common::MessageDeleteReceive {
                     id: msg
                 });
-                write_broadcast(
-                    Some((channel.default_mode_bot, channel.default_mode_user)),
-                    config,
-                    db,
-                    &packet,
-                    None,
-                    sessions
-                );
+                write_broadcast(Some(&channel), config, db, &packet, None, sessions);
             }
             Reply::None
         },
@@ -1148,7 +1156,7 @@ fn handle_packet(
             if !has_perm(
                 config,
                 id,
-                calculate_permissions_by_user(db, id, channel.default_mode_bot, channel.default_mode_user).unwrap(),
+                calculate_permissions_by_channel(db, id, &channel).unwrap(),
                 common::PERM_READ
             ) {
                 return Reply::Reply(Packet::Err(common::ERR_MISSING_PERMISSION));
@@ -1226,7 +1234,7 @@ fn handle_packet(
                 &[&event.text, &(event.id as i64)]
             ).unwrap();
 
-            Reply::Broadcast(Some((channel.default_mode_bot, channel.default_mode_user)),
+            Reply::Broadcast(Some(channel),
                 Packet::MessageReceive(common::MessageReceive {
                     inner: common::Message {
                         author: id,
@@ -1269,13 +1277,13 @@ fn handle_packet(
             if !has_perm(
                 config,
                 id,
-                calculate_permissions_by_user(db, id, channel.default_mode_bot, channel.default_mode_user).unwrap(),
+                calculate_permissions_by_channel(db, id, &channel).unwrap(),
                 common::PERM_WRITE
             ) {
                 return Reply::None; // No need to shout in their face.
             }
 
-            Reply::Broadcast(Some((channel.default_mode_bot, channel.default_mode_user)),
+            Reply::Broadcast(Some(channel),
                 Packet::TypingReceive(common::TypingReceive {
                     author: id,
                     channel: event.channel
@@ -1290,9 +1298,7 @@ fn handle_packet(
             let mut other = unwrap_or_err!(get_user(db, event.id), common::ERR_UNKNOWN_USER);
 
             if let Some(admin) = event.admin {
-                if (!user.admin && id != config.owner_id)
-                    || ((other.id == config.owner_id || other.admin)
-                    && id != config.owner_id) {
+                if id != config.owner_id {
                     return Reply::Reply(Packet::Err(common::ERR_MISSING_PERMISSION))
                 }
 
@@ -1320,15 +1326,37 @@ fn handle_packet(
                     inner: other
                 }))
             } else if let Some((channel, mode)) = event.channel_mode {
-                if !user.admin
-                    || (other.id == config.owner_id && id != config.owner_id) {
+                let mut stmt = db.prepare_cached(
+                    "SELECT default_mode_bot, default_mode_user FROM channels WHERE id = ?"
+                ).unwrap();
+                let mut rows = stmt.query(&[&(channel as i64)]).unwrap();
+                let row = rows.next().unwrap().unwrap();
+
+                let (default_mode_bot, default_mode_user) = (row.get(0), row.get(1));
+
+                if id != config.owner_id
+                    && (!has_perm(
+                        config,
+                        id,
+                        calculate_permissions(user.bot, user.modes.get(&channel).cloned(),
+                                              default_mode_bot, default_mode_user),
+                        common::PERM_MANAGE_MODES
+                    )
+                    || other.id == config.owner_id) {
+
                     return Reply::Reply(Packet::Err(common::ERR_MISSING_PERMISSION))
                 }
 
                 if let Some(mode) = mode {
-                    db.execute("UPDATE modes SET mode = ? WHERE channel = ?", &[&mode, &(channel as i64)]).unwrap();
+                    db.execute(
+                        "REPLACE INTO modes (user, channel, mode) VALUES (?, ?, ?)",
+                        &[&(other.id as i64), &(channel as i64), &mode]
+                    ).unwrap();
                 } else {
-                    db.execute("DELETE FROM modes WHERE channel = ?", &[&(channel as i64)]).unwrap();
+                    db.execute(
+                        "DELETE FROM modes WHERE user = ? AND channel = ?",
+                        &[&(other.id as i64), &(channel as i64)]
+                    ).unwrap();
                 }
 
                 other.modes = get_modes_by_user(db, other.id);
