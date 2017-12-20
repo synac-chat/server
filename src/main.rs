@@ -1294,7 +1294,7 @@ fn handle_packet(
             let id = get_id!();
             rate_limit!(id, cheap);
 
-            let mut user  = get_user(db, id).unwrap();
+            let user = get_user(db, id).unwrap();
             let mut other = unwrap_or_err!(get_user(db, event.id), common::ERR_UNKNOWN_USER);
 
             if let Some(admin) = event.admin {
