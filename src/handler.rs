@@ -688,7 +688,7 @@ pub(crate) fn handle_packet(
             let mut other = unwrap_or_err!(get_user(db, event.id), common::ERR_UNKNOWN_USER);
 
             if let Some(admin) = event.admin {
-                if id != config.owner_id {
+                if id != config.owner_id || other.id == config.owner_id {
                     return Reply::Reply(Packet::Err(common::ERR_MISSING_PERMISSION));
                 }
 
@@ -705,7 +705,6 @@ pub(crate) fn handle_packet(
                 )
             } else if let Some(ban) = event.ban {
                 if other.id == id || other.id == config.owner_id || !user.admin {
-
                     return Reply::Reply(Packet::Err(common::ERR_MISSING_PERMISSION));
                 }
 
