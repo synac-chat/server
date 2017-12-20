@@ -90,6 +90,7 @@ fn main() {
                 )", &[])
         .expect("SQLite table creation failed");
     db.execute("CREATE TABLE IF NOT EXISTS users (
+                    admin       INTEGER NOT NULL,
                     ban         INTEGER NOT NULL DEFAULT 0,
                     bot         INTEGER NOT NULL,
                     id          INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
@@ -399,11 +400,12 @@ fn get_user(db: &SqlConnection, id: usize) -> Option<common::User> {
 fn get_user_by_fields(db: &SqlConnection, row: &SqlRow) -> common::User {
     let id = row.get::<_, i64>(3) as usize;
     common::User {
-        ban: row.get(0),
-        bot: row.get(1),
+        admin: row.get(0),
+        ban: row.get(1),
+        bot: row.get(2),
         id: id,
         modes: get_modes_by_user(db, id),
-        name: row.get(5)
+        name: row.get(4)
     }
 }
 fn calculate_permissions(bot: bool, mode: Option<u8>, default_bot: u8, default_user: u8) -> u8 {
@@ -919,13 +921,20 @@ fn handle_packet(
                 });
 
                 db.execute(
-                    "INSERT INTO users (bot, last_ip, name, password, token) VALUES (?, ?, ?, ?, ?)",
-                    &[&login.bot, &ip.to_string(), &login.name, &password, &token]
+                    "INSERT INTO users (admin, bot, last_ip, name, password, token) VALUES (?, ?, ?, ?, ?, ?)",
+                    &[&false, &login.bot, &ip.to_string(), &login.name, &password, &token]
                 ).unwrap();
 
                 let id = db.last_insert_rowid() as usize;
                 let session = sessions.get_mut(&conn_id).unwrap();
                 session.id = Some(id);
+
+                let admin = id == config.owner_id;
+
+                if admin {
+                    // Can't do it directly because we don't know the row id before this.
+                    db.execute("UPDATE users SET admin = 1 WHERE id = ?", &[&(id as i64)]).unwrap();
+                }
 
                 write(&mut session.writer, Packet::LoginSuccess(common::LoginSuccess {
                     created: true,
@@ -935,6 +944,7 @@ fn handle_packet(
 
                 Reply::SendInitial(Box::new(Reply::Broadcast(None, Packet::UserReceive(common::UserReceive {
                     inner: common::User {
+                        admin: admin,
                         ban: false,
                         bot: login.bot,
                         id: id,
@@ -1276,48 +1286,55 @@ fn handle_packet(
             let id = get_id!();
             rate_limit!(id, cheap);
 
-            let mut user = unwrap_or_err!(get_user(db, event.id), common::ERR_UNKNOWN_USER);
-            if let Some(ban) = event.ban {
-        // TODO if event.id == id
-            // TODO || event.id == config.owner_id
-            // TODO || !has_perm(
-            // TODO config,
-            // TODO id,
-            // TODO calculate_permissions(user.bot, user.mode, user.default_mode_bot, ),
-            // TODO common::PERM_BAN
-        // TODO ) {
-                if true {
-                    return Reply::Reply(Packet::Err(common::ERR_MISSING_PERMISSION));
-                }
+            let mut user  = get_user(db, id).unwrap();
+            let mut other = unwrap_or_err!(get_user(db, event.id), common::ERR_UNKNOWN_USER);
 
-                db.execute(
-                    "UPDATE users SET ban = ? WHERE id = ?",
-                    &[&ban, &(event.id as i64)]
-                ).unwrap();
-                sessions.retain(|_, s| s.id != Some(event.id));
-
-                user.ban = ban;
-
-                Reply::Broadcast(None, Packet::UserReceive(common::UserReceive {
-                    inner: user
-                }))
-            } else if let Some((channel, mode)) = event.channel_mode {
-        // TODO if !has_perm(
-        // TODO     config,
-        // TODO     id,
-        // TODO     calculate_permissions(db, user.bot, &user.groups, None),
-        // TODO     common::PERM_ASSIGN_GROUPS
-        // TODO ) {
-                if true {
+            if let Some(admin) = event.admin {
+                if (!user.admin && id != config.owner_id)
+                    || ((other.id == config.owner_id || other.admin)
+                    && id != config.owner_id) {
                     return Reply::Reply(Packet::Err(common::ERR_MISSING_PERMISSION))
                 }
 
-                db.execute("UPDATE modes SET mode = ? WHERE channel = ?", &[&mode, &(channel as i64)]).unwrap();
+                db.execute("UPDATE users SET admin = ? WHERE id = ?", &[&admin, &(event.id as i64)]).unwrap();
 
-                user.modes = get_modes_by_user(db, user.id);
+                other.modes = get_modes_by_user(db, other.id);
 
                 Reply::Broadcast(None, Packet::UserReceive(common::UserReceive {
-                    inner: user
+                    inner: other
+                }))
+            } else if let Some(ban) = event.ban {
+                if other.id == id
+                    || other.id == config.owner_id
+                    || !user.admin {
+
+                    return Reply::Reply(Packet::Err(common::ERR_MISSING_PERMISSION));
+                }
+
+                db.execute("UPDATE users SET ban = ? WHERE id = ?", &[&ban, &(event.id as i64)]).unwrap();
+                sessions.retain(|_, s| s.id != Some(event.id));
+
+                other.ban = ban;
+
+                Reply::Broadcast(None, Packet::UserReceive(common::UserReceive {
+                    inner: other
+                }))
+            } else if let Some((channel, mode)) = event.channel_mode {
+                if !user.admin
+                    || (other.id == config.owner_id && id != config.owner_id) {
+                    return Reply::Reply(Packet::Err(common::ERR_MISSING_PERMISSION))
+                }
+
+                if let Some(mode) = mode {
+                    db.execute("UPDATE modes SET mode = ? WHERE channel = ?", &[&mode, &(channel as i64)]).unwrap();
+                } else {
+                    db.execute("DELETE FROM modes WHERE channel = ?", &[&(channel as i64)]).unwrap();
+                }
+
+                other.modes = get_modes_by_user(db, other.id);
+
+                Reply::Broadcast(None, Packet::UserReceive(common::UserReceive {
+                    inner: other
                 }))
             } else {
                 Reply::None
