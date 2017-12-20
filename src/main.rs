@@ -4,7 +4,8 @@ extern crate common;
 extern crate futures;
 extern crate openssl;
 extern crate rusqlite;
-#[macro_use] extern crate serde_derive;
+#[macro_use]
+extern crate serde_derive;
 extern crate serde_json;
 extern crate tokio_core;
 extern crate tokio_io;
@@ -25,22 +26,22 @@ mod handler;
 
 use handler::*;
 
+use chrono::Utc;
 use common::Packet;
 use futures::{Future, Stream};
 use openssl::pkcs12::Pkcs12;
 use openssl::rand;
-use openssl::ssl::{SslMethod, SslAcceptorBuilder};
+use openssl::ssl::{SslAcceptorBuilder, SslMethod};
 use rusqlite::{Connection as SqlConnection, Row as SqlRow};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::env;
 use std::fs::File;
-use std::io::{Read, Write, BufReader, BufWriter};
-use std::net::{Ipv4Addr, IpAddr, SocketAddr};
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
-use chrono::Utc;
 use tokio_core::net::{TcpListener, TcpStream};
 use tokio_core::reactor::{Core, Handle};
 use tokio_io::io;
@@ -70,32 +71,39 @@ fn main() {
         eprintln!("Just guessing here ¯\\_(ツ)_/¯");
         return;
     });
-    db.execute("CREATE TABLE IF NOT EXISTS channels (
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS channels (
                     default_mode_bot    INTEGER NOT NULL,
                     default_mode_user   INTEGER NOT NULL,
                     id      INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
                     name    TEXT NOT NULL
-                )", &[])
-        .expect("SQLite table creation failed");
-    db.execute("CREATE TABLE IF NOT EXISTS messages (
+                )",
+        &[]
+    ).expect("SQLite table creation failed");
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS messages (
                     author      INTEGER NOT NULL,
                     channel     INTEGER NOT NULL,
                     id          INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
                     text        BLOB NOT NULL,
                     timestamp   INTEGER NOT NULL,
                     timestamp_edit  INTEGER
-                )", &[])
-        .expect("SQLite table creation failed");
-    db.execute("CREATE TABLE IF NOT EXISTS modes (
+                )",
+        &[]
+    ).expect("SQLite table creation failed");
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS modes (
                     channel INTEGER NOT NULL,
                     user    INTEGER NOT NULL,
 
                     mode    INTEGER NOT NULL,
 
                     CONSTRAINT [unique] UNIQUE (channel, user)
-                )", &[])
-        .expect("SQLite table creation failed");
-    db.execute("CREATE TABLE IF NOT EXISTS users (
+                )",
+        &[]
+    ).expect("SQLite table creation failed");
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS users (
                     admin       INTEGER NOT NULL,
                     ban         INTEGER NOT NULL DEFAULT 0,
                     bot         INTEGER NOT NULL,
@@ -104,22 +112,25 @@ fn main() {
                     name        TEXT NOT NULL COLLATE NOCASE,
                     password    TEXT NOT NULL,
                     token       TEXT NOT NULL
-                )", &[])
-        .expect("SQLite table creation failed");
+                )",
+        &[]
+    ).expect("SQLite table creation failed");
 
     let mut args = env::args();
     args.next();
-    let port = args.next().map(|val| match val.parse() {
-        Ok(ok) => ok,
-        Err(_) => {
-            eprintln!("Warning: Supplied port is not a valid number.");
-            eprintln!("Using default.");
+    let port = args.next()
+        .map(|val| match val.parse() {
+            Ok(ok) => ok,
+            Err(_) => {
+                eprintln!("Warning: Supplied port is not a valid number.");
+                eprintln!("Using default.");
+                common::DEFAULT_PORT
+            },
+        })
+        .unwrap_or_else(|| {
+            println!("TIP: You can change port by putting it as a command line argument.");
             common::DEFAULT_PORT
-        }
-    }).unwrap_or_else(|| {
-        println!("TIP: You can change port by putting it as a command line argument.");
-        common::DEFAULT_PORT
-    });
+        });
 
     println!("Setting up...");
 
@@ -153,7 +164,8 @@ fn main() {
         &identity.pkey,
         &identity.cert,
         &identity.chain
-    ).expect("Creating SSL acceptor failed D:").build();
+    ).expect("Creating SSL acceptor failed D:")
+        .build();
 
     {
         let pem = openssl::sha::sha256(&identity.pkey.public_key_to_pem().unwrap());
@@ -184,9 +196,18 @@ fn main() {
                     config.$min > config.$max || config.$min == 0 || config.$max > $hard_max
                 }
             }
-            if is_invalid!(limit_user_name_min, limit_user_name_max, common::LIMIT_USER_NAME)
-                || is_invalid!(limit_channel_name_min, limit_channel_name_max, common::LIMIT_CHANNEL_NAME)
-                || is_invalid!(limit_message_min, limit_message_max, common::LIMIT_MESSAGE) {
+            if is_invalid!(
+                limit_user_name_min,
+                limit_user_name_max,
+                common::LIMIT_USER_NAME
+            ) ||
+                is_invalid!(
+                    limit_channel_name_min,
+                    limit_channel_name_max,
+                    common::LIMIT_CHANNEL_NAME
+                ) ||
+                is_invalid!(limit_message_min, limit_message_max, common::LIMIT_MESSAGE)
+            {
 
                 eprintln!("Your config is exceeding a hard limit");
                 return;
@@ -208,80 +229,93 @@ fn main() {
             };
 
             match File::create(path) {
-                Ok(mut file) => if let Err(err) = serde_json::to_writer_pretty(&mut file, &config) {
-                    eprintln!("Failed to generate default config: {}", err);
+                Ok(mut file) => {
+                    if let Err(err) = serde_json::to_writer_pretty(&mut file, &config) {
+                        eprintln!("Failed to generate default config: {}", err);
+                    }
                 },
-                Err(err) => eprintln!("Failed to create default config: {}", err)
+                Err(err) => eprintln!("Failed to create default config: {}", err),
             }
         }
     }
 
     let mut core = Core::new().expect("Could not start tokio core!");
     let handle = core.handle();
-    let listener = attempt_or!(TcpListener::bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), port), &handle), {
-        eprintln!("An error occured when binding TCP listener!");
-        eprintln!("Is the port in use?");
-        return;
-    });
+    let listener = attempt_or!(
+        TcpListener::bind(
+            &SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), port),
+            &handle
+        ),
+        {
+            eprintln!("An error occured when binding TCP listener!");
+            eprintln!("Is the port in use?");
+            return;
+        }
+    );
     println!("Started connection on port {}", port);
 
-    let config   = Rc::new(config);
-    let conn_id  = Rc::new(RefCell::new(0usize));
-    let db       = Rc::new(db);
-    let handle   = Rc::new(handle);
-    let ips      = Rc::new(RefCell::new(HashMap::new()));
+    let config = Rc::new(config);
+    let conn_id = Rc::new(RefCell::new(0usize));
+    let db = Rc::new(db);
+    let handle = Rc::new(handle);
+    let ips = Rc::new(RefCell::new(HashMap::new()));
     let sessions = Rc::new(RefCell::new(HashMap::new()));
-    let users    = Rc::new(RefCell::new(HashMap::new()));
+    let users = Rc::new(RefCell::new(HashMap::new()));
 
     println!("I'm alive!");
 
     let server = listener.incoming().for_each(|(conn, addr)| {
         use tokio_io::AsyncRead;
 
-        let config_clone   = Rc::clone(&config);
-        let conn_id_clone  = Rc::clone(&conn_id);
-        let db_clone       = Rc::clone(&db);
-        let handle_clone   = Rc::clone(&handle);
-        let ips_clone      = Rc::clone(&ips);
+        let config_clone = Rc::clone(&config);
+        let conn_id_clone = Rc::clone(&conn_id);
+        let db_clone = Rc::clone(&db);
+        let handle_clone = Rc::clone(&handle);
+        let ips_clone = Rc::clone(&ips);
         let sessions_clone = Rc::clone(&sessions);
-        let users_clone    = Rc::clone(&users);
+        let users_clone = Rc::clone(&users);
 
-        let accept = ssl.accept_async(conn).map_err(|_| ()).and_then(move |conn| {
-            let (reader, writer) = conn.split();
-            let reader = BufReader::new(reader);
-            let mut writer = BufWriter::new(writer);
+        let accept = ssl.accept_async(conn).map_err(|_| ()).and_then(
+            move |conn| {
+                let (reader, writer) = conn.split();
+                let reader = BufReader::new(reader);
+                let mut writer = BufWriter::new(writer);
 
-            {
-                let mut ips = ips_clone.borrow_mut();
-                let conns = ips.entry(addr.ip()).or_insert(0);
-                if *conns >= config_clone.limit_connections_per_ip {
-                    write(&mut writer, Packet::Err(common::ERR_MAX_CONN_PER_IP));
+                {
+                    let mut ips = ips_clone.borrow_mut();
+                    let conns = ips.entry(addr.ip()).or_insert(0);
+                    if *conns >= config_clone.limit_connections_per_ip {
+                        write(&mut writer, Packet::Err(common::ERR_MAX_CONN_PER_IP));
+                    }
+                    *conns += 1;
                 }
-                *conns += 1;
+
+                let my_conn_id = *conn_id_clone.borrow();
+                *conn_id_clone.borrow_mut() += 1;
+
+                sessions_clone.borrow_mut().insert(
+                    my_conn_id,
+                    Session {
+                        id: None,
+                        writer: writer
+                    }
+                );
+
+                handle_client(
+                    config_clone,
+                    my_conn_id,
+                    db_clone,
+                    &handle_clone,
+                    addr.ip(),
+                    ips_clone,
+                    reader,
+                    sessions_clone,
+                    users_clone
+                );
+
+                Ok(())
             }
-
-            let my_conn_id = *conn_id_clone.borrow();
-            *conn_id_clone.borrow_mut() += 1;
-
-            sessions_clone.borrow_mut().insert(my_conn_id, Session {
-                id: None,
-                writer: writer
-            });
-
-            handle_client(
-                config_clone,
-                my_conn_id,
-                db_clone,
-                &handle_clone,
-                addr.ip(),
-                ips_clone,
-                reader,
-                sessions_clone,
-                users_clone
-            );
-
-            Ok(())
-        });
+        );
         handle.spawn(accept);
         Ok(())
     });
@@ -289,13 +323,14 @@ fn main() {
     core.run(server).expect("Could not run tokio core!");
 }
 
-pub const TOKEN_CHARS: &[u8; 62] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+pub const TOKEN_CHARS: &[u8; 62] =
+    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 pub const RESERVED_GROUPS: usize = 2;
 
 fn check_rate_limits(config: &Config, expensive: bool, session: &mut UserSession) -> Option<u64> {
     let (duration, amount, packet_time, packets) = if expensive {
         (
-            Duration::from_secs(60*5),
+            Duration::from_secs(60 * 5),
             config.limit_requests_expensive_per_5_minutes,
             &mut session.packet_time_expensive,
             &mut session.packets_expensive
@@ -325,7 +360,9 @@ fn check_rate_limits(config: &Config, expensive: bool, session: &mut UserSession
 }
 fn from_list(input: &[usize]) -> String {
     input.iter().fold(String::new(), |mut acc, item| {
-        if !acc.is_empty() { acc.push(','); }
+        if !acc.is_empty() {
+            acc.push(',');
+        }
         acc.push_str(&item.to_string());
         acc
     })
@@ -340,7 +377,8 @@ fn gen_token() -> Result<String, openssl::error::ErrorStack> {
     Ok(unsafe { String::from_utf8_unchecked(token) })
 }
 fn get_channel(db: &SqlConnection, id: usize) -> Option<common::Channel> {
-    let mut stmt = db.prepare_cached("SELECT * FROM channels WHERE id = ?").unwrap();
+    let mut stmt = db.prepare_cached("SELECT * FROM channels WHERE id = ?")
+        .unwrap();
     let mut rows = stmt.query(&[&(id as i64)]).unwrap();
 
     if let Some(row) = rows.next() {
@@ -380,7 +418,8 @@ fn get_message_by_fields(row: &SqlRow) -> common::Message {
     }
 }
 fn get_modes_by_user(db: &SqlConnection, user: usize) -> HashMap<usize, u8> {
-    let mut stmt = db.prepare_cached("SELECT channel, mode FROM modes WHERE user = ?").unwrap();
+    let mut stmt = db.prepare_cached("SELECT channel, mode FROM modes WHERE user = ?")
+        .unwrap();
     let mut rows = stmt.query(&[&(user as i64)]).unwrap();
 
     let mut map = HashMap::new();
@@ -393,7 +432,8 @@ fn get_modes_by_user(db: &SqlConnection, user: usize) -> HashMap<usize, u8> {
     map
 }
 fn get_user(db: &SqlConnection, id: usize) -> Option<common::User> {
-    let mut stmt = db.prepare_cached("SELECT * FROM users WHERE id = ?").unwrap();
+    let mut stmt = db.prepare_cached("SELECT * FROM users WHERE id = ?")
+        .unwrap();
     let mut rows = stmt.query(&[&(id as i64)]).unwrap();
 
     if let Some(row) = rows.next() {
@@ -421,22 +461,39 @@ fn calculate_permissions(bot: bool, mode: Option<u8>, default_bot: u8, default_u
         mode.unwrap_or(default_user)
     }
 }
-fn calculate_permissions_by_user(db: &SqlConnection, id: usize, channel: usize,
-                                 default_bot: u8, default_user: u8) -> Option<u8> {
-    let mut stmt = db.prepare_cached("SELECT bot FROM users WHERE id = ?").unwrap();
+fn calculate_permissions_by_user(
+    db: &SqlConnection,
+    id: usize,
+    channel: usize,
+    default_bot: u8,
+    default_user: u8,
+) -> Option<u8> {
+    let mut stmt = db.prepare_cached("SELECT bot FROM users WHERE id = ?")
+        .unwrap();
     let mut rows = stmt.query(&[&(id as i64)]).unwrap();
 
     let bot = rows.next()?.unwrap().get(0);
 
-    let mut stmt = db.prepare_cached("SELECT mode FROM modes WHERE user = ? AND channel = ?").unwrap();
+    let mut stmt = db.prepare_cached("SELECT mode FROM modes WHERE user = ? AND channel = ?")
+        .unwrap();
     let mut rows = stmt.query(&[&(id as i64), &(channel as i64)]).unwrap();
 
     let mode = rows.next().map(|row| row.unwrap().get(0));
 
     Some(calculate_permissions(bot, mode, default_bot, default_user))
 }
-fn calculate_permissions_by_channel(db: &SqlConnection, id: usize, channel: &common::Channel) -> Option<u8> {
-    calculate_permissions_by_user(db, id, channel.id, channel.default_mode_bot, channel.default_mode_user)
+fn calculate_permissions_by_channel(
+    db: &SqlConnection,
+    id: usize,
+    channel: &common::Channel,
+) -> Option<u8> {
+    calculate_permissions_by_user(
+        db,
+        id,
+        channel.id,
+        channel.default_mode_bot,
+        channel.default_mode_user
+    )
 }
 fn has_perm(config: &Config, user: usize, bitmask: u8, perm: u8) -> bool {
     config.owner_id == user || bitmask & perm == perm
@@ -454,7 +511,7 @@ fn write_broadcast(
     db: &SqlConnection,
     packet: &Packet,
     recipient: Option<usize>,
-    sessions: &mut HashMap<usize, Session>
+    sessions: &mut HashMap<usize, Session>,
 ) {
     let encoded = attempt_or!(common::serialize(packet), {
         eprintln!("Failed to serialize message");
@@ -472,7 +529,8 @@ fn write_broadcast(
                     id,
                     calculate_permissions_by_channel(db, id, &channel).unwrap(),
                     common::PERM_READ
-                ) {
+                )
+                {
                     return true;
                 }
             }
@@ -483,11 +541,13 @@ fn write_broadcast(
             }
 
             // Yes, I should be using io::write_all here - I very much agree.
-            // However, io::write_all takes a writer, not a reference to one (understandable).
+            // However, io::write_all takes a writer, not a reference to one
+            // (understandable).
             // Sure, I could solve that with an Option (which I used to do).
             // However, if two things would try to write at once we'd have issues...
 
-            match s.writer.write_all(&size)
+            match s.writer
+                .write_all(&size)
                 .and_then(|_| s.writer.write_all(&encoded))
                 .and_then(|_| s.writer.flush()) {
                 Ok(ok) => ok,
@@ -498,7 +558,7 @@ fn write_broadcast(
                         eprintln!("Failed to deliver message to connection #{}", i);
                         eprintln!("Error kind: {}", err);
                     }
-                }
+                },
             }
         }
         true
@@ -509,7 +569,7 @@ struct UserSession {
     packet_time_cheap: Instant,
     packet_time_expensive: Instant,
     packets_cheap: usize,
-    packets_expensive: usize,
+    packets_expensive: usize
 }
 struct Session {
     id: Option<usize>,
@@ -536,20 +596,20 @@ enum Reply {
 
     Close,
     None,
-    Reply(Packet),
+    Reply(Packet)
 }
 
 fn handle_client(
-        config:   Rc<Config>,
-        conn_id:  usize,
-        db:       Rc<SqlConnection>,
-        handle:   &Rc<Handle>,
-        ip:       IpAddr,
-        ips:      Rc<RefCell<HashMap<IpAddr, u32>>>,
-        reader:   BufReader<tokio_io::io::ReadHalf<SslStream<TcpStream>>>,
-        sessions: Rc<RefCell<HashMap<usize, Session>>>,
-        users:    Rc<RefCell<HashMap<usize, UserSession>>>
-    ) {
+    config: Rc<Config>,
+    conn_id: usize,
+    db: Rc<SqlConnection>,
+    handle: &Rc<Handle>,
+    ip: IpAddr,
+    ips: Rc<RefCell<HashMap<IpAddr, u32>>>,
+    reader: BufReader<tokio_io::io::ReadHalf<SslStream<TcpStream>>>,
+    sessions: Rc<RefCell<HashMap<usize, Session>>>,
+    users: Rc<RefCell<HashMap<usize, UserSession>>>,
+) {
     macro_rules! close {
         () => {
             sessions.borrow_mut().remove(&conn_id);
@@ -559,9 +619,8 @@ fn handle_client(
     }
 
     let handle_clone = Rc::clone(handle);
-    let length = io::read_exact(reader, [0; 2])
-        .map_err(|_| ())
-        .and_then(move |(reader, bytes)| {
+    let length = io::read_exact(reader, [0; 2]).map_err(|_| ()).and_then(
+        move |(reader, bytes)| {
             let size = common::decode_u16(&bytes) as usize;
 
             if size == 0 {
@@ -583,7 +642,7 @@ fn handle_client(
                         Err(err) => {
                             eprintln!("Failed to deserialize message from client: {}", err);
                             close!();
-                        }
+                        },
                     };
 
                     let mut send_init = false;
@@ -624,14 +683,16 @@ fn handle_client(
                             );
                         },
                         Reply::SendInitial(_) => unreachable!(),
-                        Reply::Close => { close!(); },
-                        Reply::None  => {},
+                        Reply::Close => {
+                            close!();
+                        },
+                        Reply::None => {},
                         Reply::Reply(packet) => {
                             let mut sessions = sessions.borrow_mut();
                             let writer = &mut sessions.get_mut(&conn_id).unwrap().writer;
 
                             write(writer, packet);
-                        }
+                        },
                     }
 
                     if send_init {
@@ -644,20 +705,27 @@ fn handle_client(
                             while let Some(row) = rows.next() {
                                 let row = row.unwrap();
 
-                                write(writer, Packet::ChannelReceive(common::ChannelReceive {
-                                    inner: get_channel_by_fields(&row),
-                                }));
+                                write(
+                                    writer,
+                                    Packet::ChannelReceive(common::ChannelReceive {
+                                        inner: get_channel_by_fields(&row)
+                                    })
+                                );
                             }
-                        } {
+                        }
+                        {
                             let mut stmt = db.prepare_cached("SELECT * FROM users").unwrap();
                             let mut rows = stmt.query(&[]).unwrap();
 
                             while let Some(row) = rows.next() {
                                 let row = row.unwrap();
 
-                                write(writer, Packet::UserReceive(common::UserReceive {
-                                    inner: get_user_by_fields(&db, &row)
-                                }));
+                                write(
+                                    writer,
+                                    Packet::UserReceive(
+                                        common::UserReceive { inner: get_user_by_fields(&db, &row) }
+                                    )
+                                );
                             }
                         }
                     }
@@ -679,7 +747,8 @@ fn handle_client(
 
             handle_clone.spawn(lines);
             Ok(())
-        });
+        }
+    );
 
     handle.spawn(length);
 }
