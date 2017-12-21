@@ -221,11 +221,11 @@ fn main() {
                 limit_requests_expensive_per_5_minutes: 2,
 
                 limit_channel_name_max: 32,
-                limit_channel_name_min: 1,
+                limit_channel_name_min: 2,
                 limit_message_max: 1024,
                 limit_message_min: 1,
                 limit_user_name_max: 32,
-                limit_user_name_min: 1
+                limit_user_name_min: 2
             };
 
             match File::create(path) {
