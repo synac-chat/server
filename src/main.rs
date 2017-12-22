@@ -699,21 +699,6 @@ fn handle_client(
                         let mut sessions = sessions.borrow_mut();
                         let writer = &mut sessions.get_mut(&conn_id).unwrap().writer;
                         {
-                            let mut stmt = db.prepare_cached("SELECT * FROM channels").unwrap();
-                            let mut rows = stmt.query(&[]).unwrap();
-
-                            while let Some(row) = rows.next() {
-                                let row = row.unwrap();
-
-                                write(
-                                    writer,
-                                    Packet::ChannelReceive(common::ChannelReceive {
-                                        inner: get_channel_by_fields(&row)
-                                    })
-                                );
-                            }
-                        }
-                        {
                             let mut stmt = db.prepare_cached("SELECT * FROM users").unwrap();
                             let mut rows = stmt.query(&[]).unwrap();
 
@@ -725,6 +710,21 @@ fn handle_client(
                                     Packet::UserReceive(
                                         common::UserReceive { inner: get_user_by_fields(&db, &row) }
                                     )
+                                );
+                            }
+                        }
+                        {
+                            let mut stmt = db.prepare_cached("SELECT * FROM channels").unwrap();
+                            let mut rows = stmt.query(&[]).unwrap();
+
+                            while let Some(row) = rows.next() {
+                                let row = row.unwrap();
+
+                                write(
+                                    writer,
+                                    Packet::ChannelReceive(common::ChannelReceive {
+                                        inner: get_channel_by_fields(&row)
+                                    })
                                 );
                             }
                         }
