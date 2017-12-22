@@ -697,7 +697,7 @@ pub(crate) fn handle_packet(
                     &[&admin, &(event.id as i64)]
                 ).unwrap();
 
-                other.modes = get_modes_by_user(db, other.id);
+                other.admin = admin;
 
                 Reply::Broadcast(
                     None,
