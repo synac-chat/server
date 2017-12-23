@@ -527,7 +527,7 @@ fn write_broadcast(
                 if !has_perm(
                     config,
                     id,
-                    calculate_permissions_by_channel(db, id, &channel).unwrap(),
+                    calculate_permissions_by_channel(db, id, channel).unwrap(),
                     common::PERM_READ
                 )
                 {
