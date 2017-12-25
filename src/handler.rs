@@ -704,7 +704,7 @@ pub(crate) fn handle_packet(
                     Packet::UserReceive(common::UserReceive { inner: other })
                 )
             } else if let Some(ban) = event.ban {
-                if other.id == id || other.id == config.owner_id || !user.admin {
+                if !user.admin || other.admin {
                     return Reply::Reply(Packet::Err(common::ERR_MISSING_PERMISSION));
                 }
 
