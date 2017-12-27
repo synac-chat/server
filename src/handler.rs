@@ -592,7 +592,7 @@ pub(crate) fn handle_packet(
                     })
                 );
             }
-            Reply::None
+            Reply::Reply(Packet::MessageListReceived)
         },
         Packet::MessageUpdate(event) => {
             let id = get_id!();

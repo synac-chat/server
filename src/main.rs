@@ -468,14 +468,12 @@ fn calculate_permissions_by_user(
     default_bot: u8,
     default_user: u8,
 ) -> Option<u8> {
-    let mut stmt = db.prepare_cached("SELECT bot FROM users WHERE id = ?")
-        .unwrap();
+    let mut stmt = db.prepare_cached("SELECT bot FROM users WHERE id = ?").unwrap();
     let mut rows = stmt.query(&[&(id as i64)]).unwrap();
 
     let bot = rows.next()?.unwrap().get(0);
 
-    let mut stmt = db.prepare_cached("SELECT mode FROM modes WHERE user = ? AND channel = ?")
-        .unwrap();
+    let mut stmt = db.prepare_cached("SELECT mode FROM modes WHERE user = ? AND channel = ?").unwrap();
     let mut rows = stmt.query(&[&(id as i64), &(channel as i64)]).unwrap();
 
     let mode = rows.next().map(|row| row.unwrap().get(0));
