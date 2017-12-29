@@ -261,7 +261,7 @@ pub(crate) fn handle_packet(
                 }
 
                 let count: i64 = db.query_row(
-                    "SELECT COUNT(*) FROM users WHERE ban == 1 AND last_ip = ?",
+                    "SELECT COUNT(*) FROM users WHERE ban = 1 AND last_ip = ?",
                     &[&ip.to_string()],
                     |row| row.get(0)
                 ).unwrap();
@@ -328,6 +328,9 @@ pub(crate) fn handle_packet(
                         }
                     })
                 )))
+            } else if login.token.is_some() {
+                // Tried to log in unknown user via token
+                return Reply::Reply(Packet::Err(common::ERR_UNKNOWN_USER));
             } else {
                 return Reply::Reply(Packet::Err(common::ERR_MISSING_FIELD));
             }
