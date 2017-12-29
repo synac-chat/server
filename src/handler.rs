@@ -560,7 +560,7 @@ pub(crate) fn handle_packet(
                     "SELECT * FROM messages
                     WHERE channel = ? AND timestamp <=
                     (SELECT timestamp FROM messages WHERE id = ?)
-                    ORDER BY timestamp
+                    ORDER BY timestamp DESC
                     LIMIT ?"
                 ).unwrap();
                 rows = stmt.query(
