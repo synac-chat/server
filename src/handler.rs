@@ -91,7 +91,13 @@ pub(crate) fn handle_packet(
                 new.default_mode_user = 0;
                 new.name = String::new();
 
-                Some(unwrap_or_err!(get_user(db, recipient), common::ERR_UNKNOWN_USER))
+                let recipient = unwrap_or_err!(get_user(db, recipient), common::ERR_UNKNOWN_USER);
+
+                if recipient.bot {
+                    return Reply::Reply(Packet::Err(common::ERR_UNKNOWN_USER));
+                }
+
+                Some(recipient)
             } else { None };
 
             db.execute(
