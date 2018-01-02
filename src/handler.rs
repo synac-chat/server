@@ -53,45 +53,90 @@ pub(crate) fn handle_packet(
 
     match packet {
         Packet::Close => Reply::Close,
-        Packet::ChannelCreate(new) => {
+        Packet::ChannelCreate(mut new) => {
             let id = get_id!();
             rate_limit!(id, cheap);
 
+            if new.recipient == Some(id) {
+                return Reply::Reply(Packet::Err(common::ERR_SELF_PM));
+            }
+
             let mut user = get_user(db, id).unwrap();
 
-            if new.name.len() < config.limit_channel_name_min ||
-                new.name.len() > config.limit_channel_name_max
+            if new.recipient.is_none() &&
+                (new.name.len() < config.limit_channel_name_min ||
+                new.name.len() > config.limit_channel_name_max)
             {
                 return Reply::Reply(Packet::Err(common::ERR_LIMIT_REACHED));
             }
-            if !user.admin {
+            if new.recipient.is_some() && !user.admin {
                 return Reply::Reply(Packet::Err(common::ERR_MISSING_PERMISSION));
             }
 
+            let recipient = if let Some(recipient) = new.recipient {
+                // count all the private channels where nobody has any permissions except for the recipient and user
+                let count: i64 = db.query_row(
+                    "SELECT COUNT(*) FROM channels
+                    WHERE private AND default_mode_bot = 0 AND default_mode_user = 0
+                    AND id IN (SELECT channel FROM modes WHERE mode = ?1 AND user = ?2)
+                    AND id IN (SELECT channel FROM modes WHERE mode = ?1 AND user = ?3)",
+                    &[&(common::PERM_READ | common::PERM_WRITE), &(id as i64), &(recipient as i64)],
+                    |row| row.get(0)
+                ).unwrap();
+                if count != 0 {
+                    return Reply::None; // silently fail
+                }
+
+                new.default_mode_bot  = 0;
+                new.default_mode_user = 0;
+                new.name = String::new();
+
+                Some(unwrap_or_err!(get_user(db, recipient), common::ERR_UNKNOWN_USER))
+            } else { None };
+
             db.execute(
-                "INSERT INTO channels (default_mode_bot, default_mode_user, name) VALUES (?, ?, ?)",
-                &[&new.default_mode_bot, &new.default_mode_user, &new.name]
+                "INSERT INTO channels (default_mode_bot, default_mode_user, name, private) VALUES (?, ?, ?, ?)",
+                &[&new.default_mode_bot, &new.default_mode_user, &new.name, &new.recipient.is_some()]
             ).unwrap();
             let channel_id = db.last_insert_rowid() as usize;
 
-            db.execute(
-                "INSERT INTO modes (channel, user, mode) VALUES (?, ?, ?)",
-                &[&(channel_id as i64), &(id as i64), &common::PERM_ALL]
-            ).unwrap();
+            let (users, perm) = if let Some(recipient) = new.recipient {
+                ([Some(id), Some(recipient)], common::PERM_READ | common::PERM_WRITE)
+            } else {
+                ([Some(id), None], common::PERM_ALL)
+            };
+
+            for user in &users {
+                if let Some(user) = *user {
+                    db.execute(
+                        "INSERT INTO modes (channel, user, mode) VALUES (?, ?, ?)",
+                        &[&(channel_id as i64), &(user as i64), &perm]
+                    ).unwrap();
+                }
+            }
 
             user.modes = get_modes_by_user(db, user.id);
-
             let packet = Packet::UserReceive(common::UserReceive { inner: user });
             write_broadcast(None, config, db, &packet, None, sessions);
+
+            if let Some(mut recipient) = recipient {
+                recipient.modes = get_modes_by_user(db, recipient.id);
+                let packet = Packet::UserReceive(common::UserReceive { inner: recipient });
+                write_broadcast(None, config, db, &packet, None, sessions);
+            }
+
+            let channel = common::Channel {
+                default_mode_bot: new.default_mode_bot,
+                default_mode_user: new.default_mode_user,
+                id: channel_id,
+                name: new.name,
+                private: new.recipient.is_some()
+            };
+
             Reply::Broadcast(
-                None,
+                if channel.private { Some(channel.clone()) } else { None },
                 Packet::ChannelReceive(common::ChannelReceive {
-                    inner: common::Channel {
-                        default_mode_bot: new.default_mode_bot,
-                        default_mode_user: new.default_mode_user,
-                        id: channel_id,
-                        name: new.name
-                    }
+                    inner: channel
                 })
             )
         },
@@ -104,6 +149,7 @@ pub(crate) fn handle_packet(
             if !has_perm(
                 config,
                 id,
+                channel.private,
                 calculate_permissions_by_channel(db, id, &channel).unwrap(),
                 common::PERM_MANAGE_CHANNELS
             )
@@ -129,18 +175,21 @@ pub(crate) fn handle_packet(
             let id = get_id!();
             rate_limit!(id, cheap);
 
-            let new = event.inner;
+            let mut new = event.inner;
             if new.name.len() < config.limit_channel_name_min ||
                 new.name.len() > config.limit_channel_name_max
             {
                 return Reply::Reply(Packet::Err(common::ERR_LIMIT_REACHED));
             }
 
+            new.private = false;
+
             let channel = unwrap_or_err!(get_channel(db, new.id), common::ERR_UNKNOWN_CHANNEL);
 
             if !has_perm(
                 config,
                 id,
+                channel.private,
                 calculate_permissions_by_channel(db, id, &channel).unwrap(),
                 common::PERM_MANAGE_CHANNELS
             )
@@ -350,7 +399,7 @@ pub(crate) fn handle_packet(
                     |row| row.get(0)
                 ).unwrap();
                 if count != 0 {
-                    return Reply::Reply(Packet::Err(common::ERR_NAME_TAKEN));
+                    return Reply::Reply(Packet::Err(common::ERR_ALREADY_EXISTS));
                 }
                 db.execute(
                     "UPDATE users SET name = ? WHERE id = ?",
@@ -416,6 +465,7 @@ pub(crate) fn handle_packet(
             if !has_perm(
                 config,
                 id,
+                channel.private,
                 calculate_permissions_by_channel(db, id, &channel).unwrap(),
                 common::PERM_WRITE
             )
@@ -454,6 +504,7 @@ pub(crate) fn handle_packet(
                 !has_perm(
                     config,
                     id,
+                    channel.private,
                     calculate_permissions_by_channel(db, id, &channel).unwrap(),
                     common::PERM_MANAGE_MESSAGES
                 )
@@ -483,6 +534,7 @@ pub(crate) fn handle_packet(
             let has = has_perm(
                 config,
                 id,
+                channel.private,
                 calculate_permissions_by_channel(db, id, &channel).unwrap(),
                 common::PERM_MANAGE_MESSAGES
             );
@@ -534,6 +586,7 @@ pub(crate) fn handle_packet(
             if !has_perm(
                 config,
                 id,
+                channel.private,
                 calculate_permissions_by_channel(db, id, &channel).unwrap(),
                 common::PERM_READ
             )
@@ -634,33 +687,6 @@ pub(crate) fn handle_packet(
                 })
             )
         },
-        Packet::PrivateMessage(msg) => {
-            let id = get_id!();
-            rate_limit!(id, cheap);
-
-            if msg.text.len() < config.limit_message_min ||
-                msg.text.len() > config.limit_message_max
-            {
-                return Reply::Reply(Packet::Err(common::ERR_LIMIT_REACHED));
-            }
-            let count: i64 = db.query_row(
-                "SELECT COUNT(*) FROM users WHERE id = ? AND bot = 0",
-                &[&(msg.recipient as i64)],
-                |row| row.get(0)
-            ).unwrap();
-
-            if count == 0 {
-                return Reply::Reply(Packet::Err(common::ERR_UNKNOWN_USER));
-            }
-
-            Reply::Private(
-                msg.recipient,
-                Packet::PMReceive(common::PMReceive {
-                    author: id,
-                    text: msg.text
-                })
-            )
-        },
         Packet::Typing(event) => {
             let id = get_id!();
             let channel =
@@ -668,6 +694,7 @@ pub(crate) fn handle_packet(
             if !has_perm(
                 config,
                 id,
+                channel.private,
                 calculate_permissions_by_channel(db, id, &channel).unwrap(),
                 common::PERM_WRITE
             )
@@ -724,25 +751,14 @@ pub(crate) fn handle_packet(
                     Packet::UserReceive(common::UserReceive { inner: other })
                 )
             } else if let Some((channel, mode)) = event.channel_mode {
-                let mut stmt = db.prepare_cached(
-                    "SELECT default_mode_bot, default_mode_user FROM channels WHERE \
-                     id = ?"
-                ).unwrap();
-                let mut rows = stmt.query(&[&(channel as i64)]).unwrap();
-                let row = rows.next().unwrap().unwrap();
-
-                let (default_mode_bot, default_mode_user) = (row.get(0), row.get(1));
+                let channel = unwrap_or_err!(get_channel(db, channel), common::ERR_UNKNOWN_CHANNEL);
 
                 if id != config.owner_id &&
                     (!has_perm(
                         config,
                         id,
-                        calculate_permissions(
-                            user.bot,
-                            user.modes.get(&channel).cloned(),
-                            default_mode_bot,
-                            default_mode_user
-                        ),
+                        channel.private,
+                        calculate_permissions_by_channel(db, id, &channel).unwrap(),
                         common::PERM_MANAGE_MODES
                     ) || other.id == config.owner_id)
                 {
@@ -753,12 +769,12 @@ pub(crate) fn handle_packet(
                 if let Some(mode) = mode {
                     db.execute(
                         "REPLACE INTO modes (user, channel, mode) VALUES (?, ?, ?)",
-                        &[&(other.id as i64), &(channel as i64), &mode]
+                        &[&(other.id as i64), &(channel.id as i64), &mode]
                     ).unwrap();
                 } else {
                     db.execute(
                         "DELETE FROM modes WHERE user = ? AND channel = ?",
-                        &[&(other.id as i64), &(channel as i64)]
+                        &[&(other.id as i64), &(channel.id as i64)]
                     ).unwrap();
                 }
 

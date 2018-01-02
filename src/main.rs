@@ -76,7 +76,8 @@ fn main() {
                     default_mode_bot    INTEGER NOT NULL,
                     default_mode_user   INTEGER NOT NULL,
                     id      INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
-                    name    TEXT NOT NULL
+                    name    TEXT NOT NULL,
+                    private INTEGER NOT NULL
                 )",
         &[]
     ).expect("SQLite table creation failed");
@@ -393,7 +394,8 @@ fn get_channel_by_fields(row: &SqlRow) -> common::Channel {
         default_mode_bot: row.get(0),
         default_mode_user: row.get(1),
         id: row.get::<_, i64>(2) as usize,
-        name: row.get(3)
+        name: row.get(3),
+        private: row.get(4)
     }
 }
 fn get_message(db: &SqlConnection, id: usize) -> Option<common::Message> {
@@ -482,19 +484,19 @@ fn calculate_permissions_by_user(
 }
 fn calculate_permissions_by_channel(
     db: &SqlConnection,
-    id: usize,
+    user_id: usize,
     channel: &common::Channel,
 ) -> Option<u8> {
     calculate_permissions_by_user(
         db,
-        id,
+        user_id,
         channel.id,
         channel.default_mode_bot,
         channel.default_mode_user
     )
 }
-fn has_perm(config: &Config, user: usize, bitmask: u8, perm: u8) -> bool {
-    config.owner_id == user || bitmask & perm == perm
+fn has_perm(config: &Config, user: usize, private: bool, bitmask: u8, perm: u8) -> bool {
+    (config.owner_id == user && !private) || bitmask & perm == perm
 }
 fn write<T: std::io::Write>(writer: &mut T, packet: Packet) -> bool {
     attempt_or!(common::write(writer, &packet), {
@@ -525,6 +527,7 @@ fn write_broadcast(
                 if !has_perm(
                     config,
                     id,
+                    channel.private,
                     calculate_permissions_by_channel(db, id, channel).unwrap(),
                     common::PERM_READ
                 )
@@ -695,7 +698,8 @@ fn handle_client(
 
                     if send_init {
                         let mut sessions = sessions.borrow_mut();
-                        let writer = &mut sessions.get_mut(&conn_id).unwrap().writer;
+                        let session = sessions.get_mut(&conn_id).unwrap();
+                        let writer  = &mut session.writer;
                         {
                             let mut stmt = db.prepare_cached("SELECT * FROM users").unwrap();
                             let mut rows = stmt.query(&[]).unwrap();
@@ -718,12 +722,23 @@ fn handle_client(
                             while let Some(row) = rows.next() {
                                 let row = row.unwrap();
 
-                                write(
-                                    writer,
-                                    Packet::ChannelReceive(common::ChannelReceive {
-                                        inner: get_channel_by_fields(&row)
-                                    })
-                                );
+                                let channel = get_channel_by_fields(&row);
+                                let id = session.id.unwrap();
+
+                                if !channel.private || has_perm(
+                                    &config,
+                                    id,
+                                    channel.private,
+                                    calculate_permissions_by_channel(&db, id, &channel).unwrap(),
+                                    common::PERM_READ
+                                ) {
+                                    write(
+                                        writer,
+                                        Packet::ChannelReceive(common::ChannelReceive {
+                                            inner: channel
+                                        })
+                                    );
+                                }
                             }
                         }
                     }
