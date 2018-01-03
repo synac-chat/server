@@ -259,7 +259,6 @@ fn main() {
     let conn_id = Rc::new(RefCell::new(0usize));
     let db = Rc::new(db);
     let handle = Rc::new(handle);
-    let ips = Rc::new(RefCell::new(HashMap::new()));
     let sessions = Rc::new(RefCell::new(HashMap::new()));
     let users = Rc::new(RefCell::new(HashMap::new()));
 
@@ -268,13 +267,12 @@ fn main() {
     let server = listener.incoming().for_each(|(conn, addr)| {
         use tokio_io::AsyncRead;
 
-        let config_clone = Rc::clone(&config);
-        let conn_id_clone = Rc::clone(&conn_id);
-        let db_clone = Rc::clone(&db);
+        let config = Rc::clone(&config);
+        let conn_id = Rc::clone(&conn_id);
+        let db = Rc::clone(&db);
         let handle_clone = Rc::clone(&handle);
-        let ips_clone = Rc::clone(&ips);
-        let sessions_clone = Rc::clone(&sessions);
-        let users_clone = Rc::clone(&users);
+        let sessions = Rc::clone(&sessions);
+        let users = Rc::clone(&users);
 
         let accept = ssl.accept_async(conn).map_err(|_| ()).and_then(
             move |conn| {
@@ -282,36 +280,37 @@ fn main() {
                 let reader = BufReader::new(reader);
                 let mut writer = BufWriter::new(writer);
 
-                {
-                    let mut ips = ips_clone.borrow_mut();
-                    let conns = ips.entry(addr.ip()).or_insert(0);
-                    if *conns >= config_clone.limit_connections_per_ip {
-                        write(&mut writer, Packet::Err(common::ERR_MAX_CONN_PER_IP));
-                    }
-                    *conns += 1;
+                let addr = addr.ip();
+
+                let conns = sessions.borrow().values()
+                    .filter(|session: &&Session| (**session).ip == addr)
+                    .count();
+                if conns >= config.limit_connections_per_ip as usize {
+                    write(&mut writer, Packet::Err(common::ERR_MAX_CONN_PER_IP));
+                    return Ok(());
                 }
 
-                let my_conn_id = *conn_id_clone.borrow();
-                *conn_id_clone.borrow_mut() += 1;
+                let my_conn_id = *conn_id.borrow();
+                *conn_id.borrow_mut() += 1;
 
-                sessions_clone.borrow_mut().insert(
+                sessions.borrow_mut().insert(
                     my_conn_id,
                     Session {
                         id: None,
+                        ip: addr,
                         writer: writer
                     }
                 );
 
                 handle_client(
-                    config_clone,
+                    config,
                     my_conn_id,
-                    db_clone,
+                    db,
                     &handle_clone,
-                    addr.ip(),
-                    ips_clone,
+                    addr,
                     reader,
-                    sessions_clone,
-                    users_clone
+                    sessions,
+                    users
                 );
 
                 Ok(())
@@ -574,6 +573,7 @@ struct UserSession {
 }
 struct Session {
     id: Option<usize>,
+    ip: IpAddr,
     writer: BufWriter<tokio_io::io::WriteHalf<SslStream<TcpStream>>>
 }
 impl UserSession {
@@ -606,31 +606,34 @@ fn handle_client(
     db: Rc<SqlConnection>,
     handle: &Rc<Handle>,
     ip: IpAddr,
-    ips: Rc<RefCell<HashMap<IpAddr, u32>>>,
     reader: BufReader<tokio_io::io::ReadHalf<SslStream<TcpStream>>>,
     sessions: Rc<RefCell<HashMap<usize, Session>>>,
     users: Rc<RefCell<HashMap<usize, UserSession>>>,
 ) {
     macro_rules! close {
         () => {
-            sessions.borrow_mut().remove(&conn_id);
-            *ips.borrow_mut().get_mut(&ip).unwrap() -= 1;
-            return Ok(());
+            close!(sessions);
+        };
+        ($sessions:expr) => {
+            $sessions.borrow_mut().remove(&conn_id);
         }
     }
 
     let handle_clone = Rc::clone(handle);
-    let length = io::read_exact(reader, [0; 2]).map_err(|_| ()).and_then(
+    let sessions_clone = Rc::clone(&sessions);
+    let length = io::read_exact(reader, [0; 2]).map_err(move |_| { close!(sessions_clone); }).and_then(
         move |(reader, bytes)| {
             let size = common::decode_u16(&bytes) as usize;
 
             if size == 0 {
                 close!();
+                return Ok(());
             }
 
             let handle_clone_clone_ugh = Rc::clone(&handle_clone);
+            let sessions_clone = Rc::clone(&sessions);
             let lines = io::read_exact(reader, vec![0; size])
-                .map_err(|_| ())
+                .map_err(move |_| { close!(sessions_clone); })
                 .and_then(move |(reader, bytes)| {
                     if !sessions.borrow().contains_key(&conn_id) {
                         // Server wrongfully assumed client was dead after failed write.
@@ -643,6 +646,7 @@ fn handle_client(
                         Err(err) => {
                             eprintln!("Failed to deserialize message from client: {}", err);
                             close!();
+                            return Ok(());
                         },
                     };
 
@@ -686,6 +690,7 @@ fn handle_client(
                         Reply::SendInitial(_) => unreachable!(),
                         Reply::Close => {
                             close!();
+                            return Ok(());
                         },
                         Reply::None => {},
                         Reply::Reply(packet) => {
@@ -749,7 +754,6 @@ fn handle_client(
                         db,
                         &handle_clone_clone_ugh,
                         ip,
-                        ips,
                         reader,
                         sessions,
                         users

@@ -52,7 +52,6 @@ pub(crate) fn handle_packet(
     }
 
     match packet {
-        Packet::Close => Reply::Close,
         Packet::ChannelCreate(mut new) => {
             let id = get_id!();
             rate_limit!(id, cheap);
