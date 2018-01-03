@@ -39,7 +39,6 @@ Differences from IRC:
 - Message logs are kept by default.
 - Most configuration is done from inside the application itself.
 - Nicknames are claimed using a password by default.
-- Private messages are end-to-end encrypted
 
 ## Why not Discord?
 
@@ -50,7 +49,6 @@ Differences from Discord:
 - No terms of service. Do what you want.
 - No voice support.
 - Open source.
-- Private messages are end-to-end encrypted
 - Self-hosted. You will have to set up the server yourself (this is good for security.)
 - You can not only allow, but also deny a permission. Meaning you won't struggle with trying to make a "muted" role.
 
