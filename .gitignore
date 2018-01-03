@@ -2,3 +2,4 @@ target
 data.sqlite
 cert.pfx
 optional-config.json
+update.sh
