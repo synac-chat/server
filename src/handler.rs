@@ -69,7 +69,7 @@ pub(crate) fn handle_packet(
             {
                 return Reply::Reply(Packet::Err(common::ERR_LIMIT_REACHED));
             }
-            if new.recipient.is_some() && !user.admin {
+            if new.recipient.is_none() && !user.admin {
                 return Reply::Reply(Packet::Err(common::ERR_MISSING_PERMISSION));
             }
 
