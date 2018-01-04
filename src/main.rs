@@ -169,15 +169,17 @@ fn main() {
         .build();
 
     {
-        let pem = openssl::sha::sha256(&identity.pkey.public_key_to_pem().unwrap());
-        let mut pem_str = String::with_capacity(64);
-        for byte in &pem {
-            pem_str.push_str(&format!("{:02X}", byte));
+        use std::fmt::Write;
+
+        let hash = openssl::sha::sha256(&identity.pkey.public_key_to_pem().unwrap());
+        let mut hash_str = String::with_capacity(64);
+        for byte in &hash {
+            write!(hash_str, "{:02X}", byte).unwrap();
         }
         println!("Almost there! To secure your users' connection,");
         println!("you will have to send a piece of data manually.");
         println!("The text is as follows:");
-        println!("{}", pem_str);
+        println!("{}", hash_str);
     }
 
     let config: Config;
