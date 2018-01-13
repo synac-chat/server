@@ -28,7 +28,7 @@ use handler::*;
 
 use chrono::Utc;
 use common::Packet;
-use futures::{Future, Stream};
+use futures::{future, Future, Stream};
 use openssl::pkcs12::Pkcs12;
 use openssl::rand;
 use openssl::ssl::{SslAcceptorBuilder, SslMethod};
@@ -43,7 +43,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use tokio_core::net::{TcpListener, TcpStream};
-use tokio_core::reactor::{Core, Handle};
+use tokio_core::reactor::Core;
 use tokio_io::io;
 use tokio_openssl::{SslAcceptorExt, SslStream};
 
@@ -260,67 +260,199 @@ fn main() {
     let config = Rc::new(config);
     let conn_id = Rc::new(RefCell::new(0usize));
     let db = Rc::new(db);
-    let handle = Rc::new(handle);
     let sessions = Rc::new(RefCell::new(HashMap::new()));
     let users = Rc::new(RefCell::new(HashMap::new()));
 
     println!("I'm alive!");
 
-    let server = listener.incoming().for_each(|(conn, addr)| {
-        use tokio_io::AsyncRead;
+    let server = listener
+        .incoming()
+        .map_err(|_| ())
+        .for_each(|(conn, addr)| {
+            use tokio_io::AsyncRead;
 
-        let config = Rc::clone(&config);
-        let conn_id = Rc::clone(&conn_id);
-        let db = Rc::clone(&db);
-        let handle_clone = Rc::clone(&handle);
-        let sessions = Rc::clone(&sessions);
-        let users = Rc::clone(&users);
+            let config = Rc::clone(&config);
+            let conn_id = Rc::clone(&conn_id);
+            let db = Rc::clone(&db);
+            let sessions = Rc::clone(&sessions);
+            let users = Rc::clone(&users);
 
-        let accept = ssl.accept_async(conn).map_err(|_| ()).and_then(
-            move |conn| {
-                let (reader, writer) = conn.split();
-                let reader = BufReader::new(reader);
-                let mut writer = BufWriter::new(writer);
+            ssl.accept_async(conn)
+                .map_err(|_| ())
+                .and_then(move |conn| -> Box<Future<Item = (), Error = ()>> {
+                    let (reader, writer) = conn.split();
+                    let reader = BufReader::new(reader);
+                    let mut writer = BufWriter::new(writer);
 
-                let addr = addr.ip();
+                    let addr = addr.ip();
 
-                let conns = sessions.borrow().values()
-                    .filter(|session: &&Session| (**session).ip == addr)
-                    .count();
-                if conns >= config.limit_connections_per_ip as usize {
-                    write(&mut writer, Packet::Err(common::ERR_MAX_CONN_PER_IP));
-                    return Ok(());
-                }
-
-                let my_conn_id = *conn_id.borrow();
-                *conn_id.borrow_mut() += 1;
-
-                sessions.borrow_mut().insert(
-                    my_conn_id,
-                    Session {
-                        id: None,
-                        ip: addr,
-                        writer: writer
+                    let conns = sessions.borrow().values()
+                        .filter(|session: &&Session| (**session).ip == addr)
+                        .count();
+                    if conns >= config.limit_connections_per_ip as usize {
+                        write(&mut writer, Packet::Err(common::ERR_MAX_CONN_PER_IP));
+                        return Box::new(future::err(()));
                     }
-                );
 
-                handle_client(
-                    config,
-                    my_conn_id,
-                    db,
-                    &handle_clone,
-                    addr,
-                    reader,
-                    sessions,
-                    users
-                );
+                    let my_conn_id = *conn_id.borrow();
+                    *conn_id.borrow_mut() += 1;
 
-                Ok(())
-            }
-        );
-        handle.spawn(accept);
-        Ok(())
-    });
+                    sessions.borrow_mut().insert(
+                        my_conn_id,
+                        Session {
+                            id: None,
+                            ip: addr,
+                            writer: writer
+                        }
+                    );
+
+                    let conn_id = my_conn_id;
+
+                    Box::new(future::loop_fn(reader, move |reader| {
+                        let config = Rc::clone(&config);
+                        let db = Rc::clone(&db);
+                        let sessions = Rc::clone(&sessions);
+                        let users = Rc::clone(&users);
+
+                        macro_rules! close {
+                            () => {
+                                close!(sessions);
+                            };
+                            ($sessions:expr) => {
+                                $sessions.borrow_mut().remove(&conn_id);
+                            }
+                        }
+
+                        let sessions_clone = Rc::clone(&sessions);
+                        io::read_exact(reader, [0; 2])
+                            .map_err(move |_| { close!(sessions_clone); })
+                            .and_then(move |(reader, bytes)| -> Box<Future<Item = future::Loop<(), _>, Error = ()>> {
+                                let size = common::decode_u16(&bytes) as usize;
+
+                                if size == 0 {
+                                    close!();
+                                    return Box::new(future::err(()));
+                                }
+
+                                let sessions_clone = Rc::clone(&sessions);
+                                Box::new(io::read_exact(reader, vec![0; size])
+                                    .map_err(move |_| { close!(sessions_clone); })
+                                    .and_then(move |(reader, bytes)| {
+                                        assert!(sessions.borrow().contains_key(&conn_id));
+
+                                        let packet = match common::deserialize(&bytes) {
+                                            Ok(ok) => ok,
+                                            Err(err) => {
+                                                eprintln!("Failed to deserialize message from client: {}", err);
+                                                close!();
+                                                return Ok(future::Loop::Break(()));
+                                            },
+                                        };
+
+                                        let mut send_init = false;
+                                        let mut reply = handle_packet(
+                                            &config,
+                                            conn_id,
+                                            &db,
+                                            &addr,
+                                            packet,
+                                            &mut sessions.borrow_mut(),
+                                            &mut users.borrow_mut()
+                                        );
+
+                                        if let Reply::SendInitial(inner) = reply {
+                                            send_init = true;
+                                            reply = *inner;
+                                        }
+
+                                        match reply {
+                                            Reply::Broadcast(channel, packet) => {
+                                                write_broadcast(
+                                                    channel.as_ref(),
+                                                    &config,
+                                                    &db,
+                                                    &packet,
+                                                    None,
+                                                    &mut sessions.borrow_mut()
+                                                );
+                                            },
+                                            Reply::Private(recipient, packet) => {
+                                                write_broadcast(
+                                                    None,
+                                                    &config,
+                                                    &db,
+                                                    &packet,
+                                                    Some(recipient),
+                                                    &mut sessions.borrow_mut()
+                                                );
+                                            },
+                                            Reply::SendInitial(_) => unreachable!(),
+                                            Reply::Close => {
+                                                close!();
+                                                return Ok(future::Loop::Break(()));
+                                            },
+                                            Reply::None => {},
+                                            Reply::Reply(packet) => {
+                                                let mut sessions = sessions.borrow_mut();
+                                                let writer = &mut sessions.get_mut(&conn_id).unwrap().writer;
+
+                                                write(writer, packet);
+                                            },
+                                        }
+
+                                        if send_init {
+                                            let mut sessions = sessions.borrow_mut();
+                                            let session = sessions.get_mut(&conn_id).unwrap();
+                                            let writer  = &mut session.writer;
+                                            {
+                                                let mut stmt = db.prepare_cached("SELECT * FROM users").unwrap();
+                                                let mut rows = stmt.query(&[]).unwrap();
+
+                                                while let Some(row) = rows.next() {
+                                                    let row = row.unwrap();
+
+                                                    write(
+                                                        writer,
+                                                        Packet::UserReceive(
+                                                            common::UserReceive { inner: get_user_by_fields(&db, &row) }
+                                                        )
+                                                    );
+                                                }
+                                            }
+                                            {
+                                                let mut stmt = db.prepare_cached("SELECT * FROM channels").unwrap();
+                                                let mut rows = stmt.query(&[]).unwrap();
+
+                                                while let Some(row) = rows.next() {
+                                                    let row = row.unwrap();
+
+                                                    let channel = get_channel_by_fields(&row);
+                                                    let id = session.id.unwrap();
+
+                                                    if !channel.private || has_perm(
+                                                        &config,
+                                                        id,
+                                                        channel.private,
+                                                        calculate_permissions_by_channel(&db, id, &channel).unwrap(),
+                                                        common::PERM_READ
+                                                    ) {
+                                                        write(
+                                                            writer,
+                                                            Packet::ChannelReceive(common::ChannelReceive {
+                                                                inner: channel
+                                                            })
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        Ok(future::Loop::Continue(reader))
+                                    }))
+                            })
+                    }))
+                })
+        });
 
     core.run(server).expect("Could not run tokio core!");
 }
@@ -600,174 +732,4 @@ enum Reply {
     Close,
     None,
     Reply(Packet)
-}
-
-fn handle_client(
-    config: Rc<Config>,
-    conn_id: usize,
-    db: Rc<SqlConnection>,
-    handle: &Rc<Handle>,
-    ip: IpAddr,
-    reader: BufReader<tokio_io::io::ReadHalf<SslStream<TcpStream>>>,
-    sessions: Rc<RefCell<HashMap<usize, Session>>>,
-    users: Rc<RefCell<HashMap<usize, UserSession>>>,
-) {
-    macro_rules! close {
-        () => {
-            close!(sessions);
-        };
-        ($sessions:expr) => {
-            $sessions.borrow_mut().remove(&conn_id);
-        }
-    }
-
-    let handle_clone = Rc::clone(handle);
-    let sessions_clone = Rc::clone(&sessions);
-    let length = io::read_exact(reader, [0; 2]).map_err(move |_| { close!(sessions_clone); }).and_then(
-        move |(reader, bytes)| {
-            let size = common::decode_u16(&bytes) as usize;
-
-            if size == 0 {
-                close!();
-                return Ok(());
-            }
-
-            let handle_clone_clone_ugh = Rc::clone(&handle_clone);
-            let sessions_clone = Rc::clone(&sessions);
-            let lines = io::read_exact(reader, vec![0; size])
-                .map_err(move |_| { close!(sessions_clone); })
-                .and_then(move |(reader, bytes)| {
-                    if !sessions.borrow().contains_key(&conn_id) {
-                        // Server wrongfully assumed client was dead after failed write.
-                        // Well, too late now...
-                        // ... or if the user is banned, since I abused this "feature"
-                        return Ok(());
-                    }
-                    let packet = match common::deserialize(&bytes) {
-                        Ok(ok) => ok,
-                        Err(err) => {
-                            eprintln!("Failed to deserialize message from client: {}", err);
-                            close!();
-                            return Ok(());
-                        },
-                    };
-
-                    let mut send_init = false;
-                    let mut reply = handle_packet(
-                        &config,
-                        conn_id,
-                        &db,
-                        &ip,
-                        packet,
-                        &mut sessions.borrow_mut(),
-                        &mut users.borrow_mut()
-                    );
-
-                    if let Reply::SendInitial(inner) = reply {
-                        send_init = true;
-                        reply = *inner;
-                    }
-
-                    match reply {
-                        Reply::Broadcast(channel, packet) => {
-                            write_broadcast(
-                                channel.as_ref(),
-                                &config,
-                                &db,
-                                &packet,
-                                None,
-                                &mut sessions.borrow_mut()
-                            );
-                        },
-                        Reply::Private(recipient, packet) => {
-                            write_broadcast(
-                                None,
-                                &config,
-                                &db,
-                                &packet,
-                                Some(recipient),
-                                &mut sessions.borrow_mut()
-                            );
-                        },
-                        Reply::SendInitial(_) => unreachable!(),
-                        Reply::Close => {
-                            close!();
-                            return Ok(());
-                        },
-                        Reply::None => {},
-                        Reply::Reply(packet) => {
-                            let mut sessions = sessions.borrow_mut();
-                            let writer = &mut sessions.get_mut(&conn_id).unwrap().writer;
-
-                            write(writer, packet);
-                        },
-                    }
-
-                    if send_init {
-                        let mut sessions = sessions.borrow_mut();
-                        let session = sessions.get_mut(&conn_id).unwrap();
-                        let writer  = &mut session.writer;
-                        {
-                            let mut stmt = db.prepare_cached("SELECT * FROM users").unwrap();
-                            let mut rows = stmt.query(&[]).unwrap();
-
-                            while let Some(row) = rows.next() {
-                                let row = row.unwrap();
-
-                                write(
-                                    writer,
-                                    Packet::UserReceive(
-                                        common::UserReceive { inner: get_user_by_fields(&db, &row) }
-                                    )
-                                );
-                            }
-                        }
-                        {
-                            let mut stmt = db.prepare_cached("SELECT * FROM channels").unwrap();
-                            let mut rows = stmt.query(&[]).unwrap();
-
-                            while let Some(row) = rows.next() {
-                                let row = row.unwrap();
-
-                                let channel = get_channel_by_fields(&row);
-                                let id = session.id.unwrap();
-
-                                if !channel.private || has_perm(
-                                    &config,
-                                    id,
-                                    channel.private,
-                                    calculate_permissions_by_channel(&db, id, &channel).unwrap(),
-                                    common::PERM_READ
-                                ) {
-                                    write(
-                                        writer,
-                                        Packet::ChannelReceive(common::ChannelReceive {
-                                            inner: channel
-                                        })
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    handle_client(
-                        config,
-                        conn_id,
-                        db,
-                        &handle_clone_clone_ugh,
-                        ip,
-                        reader,
-                        sessions,
-                        users
-                    );
-
-                    Ok(())
-                });
-
-            handle_clone.spawn(lines);
-            Ok(())
-        }
-    );
-
-    handle.spawn(length);
 }
