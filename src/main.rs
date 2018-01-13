@@ -31,7 +31,7 @@ use common::Packet;
 use futures::{future, Future, Stream};
 use openssl::pkcs12::Pkcs12;
 use openssl::rand;
-use openssl::ssl::{SslAcceptorBuilder, SslMethod};
+use openssl::ssl::{SslAcceptor, SslMethod};
 use rusqlite::{Connection as SqlConnection, Row as SqlRow};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -160,14 +160,6 @@ fn main() {
             return;
         })
     };
-    let ssl = SslAcceptorBuilder::mozilla_intermediate(
-        SslMethod::tls(),
-        &identity.pkey,
-        &identity.cert,
-        &identity.chain
-    ).expect("Creating SSL acceptor failed D:")
-        .build();
-
     {
         use std::fmt::Write;
 
@@ -181,6 +173,23 @@ fn main() {
         println!("The text is as follows:");
         println!("{}", hash_str);
     }
+    let ssl = match SslAcceptor::mozilla_intermediate(SslMethod::tls())
+        .and_then(|mut ssl| ssl.set_private_key(&identity.pkey).map(|_| ssl))
+        .and_then(|mut ssl| ssl.set_certificate(&identity.cert).map(|_| ssl))
+        .and_then(|mut ssl| {
+            let mut result = Ok(());
+            for chain in identity.chain.unwrap() {
+                result = result.and_then(|_| ssl.add_extra_chain_cert(chain));
+            }
+            result.map(|_| ssl)
+        })
+        .map(|ssl| ssl.build()) {
+        Ok(ssl) => ssl,
+        Err(err) => {
+            eprintln!("Failed to create an SSL acceptor instance: {}", err);
+            return;
+        }
+    };
 
     let config: Config;
     {
