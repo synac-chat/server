@@ -178,8 +178,10 @@ fn main() {
         .and_then(|mut ssl| ssl.set_certificate(&identity.cert).map(|_| ssl))
         .and_then(|mut ssl| {
             let mut result = Ok(());
-            for chain in identity.chain.unwrap() {
-                result = result.and_then(|_| ssl.add_extra_chain_cert(chain));
+            if let Some(chains) = identity.chain {
+                for chain in chains {
+                    result = result.and_then(|_| ssl.add_extra_chain_cert(chain));
+                }
             }
             result.map(|_| ssl)
         })
@@ -269,6 +271,7 @@ fn main() {
     let config = Rc::new(config);
     let conn_id = Rc::new(RefCell::new(0usize));
     let db = Rc::new(db);
+    let handle = Rc::new(core.handle());
     let sessions = Rc::new(RefCell::new(HashMap::new()));
     let users = Rc::new(RefCell::new(HashMap::new()));
 
@@ -283,10 +286,11 @@ fn main() {
             let config = Rc::clone(&config);
             let conn_id = Rc::clone(&conn_id);
             let db = Rc::clone(&db);
+            let handle = Rc::clone(&handle);
             let sessions = Rc::clone(&sessions);
             let users = Rc::clone(&users);
 
-            ssl.accept_async(conn)
+            handle.spawn(ssl.accept_async(conn)
                 .map_err(|_| ())
                 .and_then(move |conn| -> Box<Future<Item = (), Error = ()>> {
                     let (reader, writer) = conn.split();
@@ -300,7 +304,7 @@ fn main() {
                         .count();
                     if conns >= config.limit_connections_per_ip as usize {
                         write(&mut writer, Packet::Err(common::ERR_MAX_CONN_PER_IP));
-                        return Box::new(future::err(()));
+                        return Box::new(future::ok(()));
                     }
 
                     let my_conn_id = *conn_id.borrow();
@@ -340,7 +344,7 @@ fn main() {
 
                                 if size == 0 {
                                     close!();
-                                    return Box::new(future::err(()));
+                                    return Box::new(future::ok(future::Loop::Break(())));
                                 }
 
                                 let sessions_clone = Rc::clone(&sessions);
@@ -460,7 +464,8 @@ fn main() {
                                     }))
                             })
                     }))
-                })
+                }));
+            Ok(())
         });
 
     core.run(server).expect("Could not run tokio core!");
